@@ -30,6 +30,7 @@ const os = require('os');
 const child_process = require('child_process');
 
 const IS_WIN = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
 const EXE = IS_WIN ? '.exe' : '';
 // 国际化：所有“用户可见”的文案都走 t()。英文是源语言，中文翻译在 l10n/bundle.l10n.zh-cn.json，
 // 由 VS Code 根据显示语言自动加载（vscode.l10n，需 VS Code >= 1.73）。
@@ -50,6 +51,13 @@ const SCAN_DEPTH = 4;                 // 从工作区根向下递归的深度
 const SKIP_DIRS = new Set(['.git', '.hg', '.svn', '.vs', '.cache', 'node_modules', '.venv', 'venv', '__pycache__', 'dist']);
 const LOG_FILE = path.join(os.tmpdir(), 'stm32-flash-button.log');
 const LOG_MAX = 512 * 1024;
+// macOS 的终端规范输入缓冲区较小。连续向新终端 sendText 多条提示和一条长命令时，
+// 输入可能在到达 shell 前被截断、重放或交错。按 UTF-8 字节分块并串行发送，既避免
+// 切开多字节字符，也给 shell 足够时间消费输入。
+const TERM_CHUNK_BYTES = 256;
+const TERM_CHUNK_DELAY_MS = 8;
+const TERM_READY_FALLBACK_MS = 500;
+const _termWrites = new WeakMap();
 // 文件日志：终端可能被弹窗打断、被刷屏，出问题时直接看这个文件最省事。
 // 任何一步报错都会被记下来，不会再出现「终端打了几行就没下文」的鬼故事。
 function log() {
@@ -355,6 +363,71 @@ function shellPath() {
     if (IS_WIN) return process.env.ComSpec || 'cmd.exe';
     return fs.existsSync('/bin/bash') ? '/bin/bash' : '/bin/sh';   // 极简 Linux 可能没有 bash
 }
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+// 新终端创建后 createTerminal() 会立即返回，但 shell 可能还没有准备好读取输入。
+// 优先等待 shell integration；用户关闭该功能时，短暂等待后继续，避免永久卡住。
+function waitForTerminalReady(term) {
+    if (!IS_MAC) return Promise.resolve();
+    try { if (term.shellIntegration) return Promise.resolve(); } catch (_) { }
+    return new Promise(resolve => {
+        let done = false, timer = null, sub = null;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            if (timer) clearTimeout(timer);
+            try { if (sub) sub.dispose(); } catch (_) { }
+            resolve();
+        };
+        try {
+            const onReady = vscode.window.onDidChangeTerminalShellIntegration;
+            if (typeof onReady === 'function') {
+                sub = onReady(e => { if (e && e.terminal === term) finish(); });
+            }
+            if (term.shellIntegration) return finish();
+        } catch (_) { }
+        timer = setTimeout(finish, TERM_READY_FALLBACK_MS);
+    });
+}
+// JavaScript 的 length 统计 UTF-16 code unit，而终端限制针对 UTF-8 字节；必须按字节切分。
+function utf8Chunks(value, maxBytes) {
+    const out = [];
+    let chunk = '', bytes = 0;
+    for (const ch of String(value)) {
+        const n = Buffer.byteLength(ch, 'utf8');
+        if (chunk && bytes + n > maxBytes) {
+            out.push(chunk);
+            chunk = '';
+            bytes = 0;
+        }
+        chunk += ch;
+        bytes += n;
+    }
+    if (chunk) out.push(chunk);
+    return out;
+}
+// 所有 macOS 终端输入共用同一条逐终端队列，避免多个 sendText 调用在 PTY 中交错。
+function sendTerminalText(term, value, shouldExecute) {
+    const text = String(value == null ? '' : value);
+    const execute = shouldExecute !== false;
+    if (!IS_MAC) {
+        term.sendText(text, execute);
+        return Promise.resolve();
+    }
+    const previous = _termWrites.get(term) || Promise.resolve();
+    const next = previous.catch(() => { }).then(async () => {
+        for (const chunk of utf8Chunks(text, TERM_CHUNK_BYTES)) {
+            term.sendText(chunk, false);
+            await delay(TERM_CHUNK_DELAY_MS);
+        }
+        if (execute) {
+            // 空字符串 + shouldExecute 只发送回车，避免把回车附在最后一个大块里。
+            term.sendText('', true);
+            await delay(TERM_CHUNK_DELAY_MS);
+        }
+    });
+    _termWrites.set(term, next);
+    return next;
+}
 // 终端是否正在执行上一条命令（需要 shell integration，不支持时一律返回 false）
 function termBusy(t) {
     try {
@@ -388,6 +461,7 @@ let _lastTerm = null;
 // 创建时先把工具链目录注入 PATH；复用终端时 env 无法更新，所以命令里还会再设一次。
 function getTerm(dirs, clear) {
     let t = vscode.window.terminals.find(x => x.name === TERM_NAME && !x.exitStatus);
+    let created = false;
     if (t) {
         const co = t.creationOptions || {};
         const cur = co.shellPath ? path.basename(String(co.shellPath)).toLowerCase() : '';
@@ -396,7 +470,11 @@ function getTerm(dirs, clear) {
             t = null;
         }
     }
-    if (!t) t = vscode.window.createTerminal({ name: TERM_NAME, shellPath: shellPath(), env: envWithPath(dirs) });
+    if (!t) {
+        t = vscode.window.createTerminal({ name: TERM_NAME, shellPath: shellPath(), env: envWithPath(dirs) });
+        created = true;
+    }
+    if (created && IS_MAC) _termWrites.set(t, waitForTerminalReady(t));
     t.show(true);
     if (clear) termClear(t);
     ensureUtf8(t);
@@ -409,14 +487,14 @@ function termLine(t, s) {
     if (IS_WIN) {
         // 注意：cmd 的 echo 里 % 无法用 ^ 转义，直接换成全角字符，避免提示文本显示异常
         const esc = s.replace(/\^/g, '^^').replace(/%/g, '％').replace(/[&|<>()!]/g, m => '^' + m);
-        t.sendText('echo ' + esc, true);
+        return sendTerminalText(t, 'echo ' + esc, true);
     } else {
         const esc = s.replace(/'/g, `'\''`);
-        t.sendText("echo '" + esc + "'", true);
+        return sendTerminalText(t, "echo '" + esc + "'", true);
     }
 }
-function termClear(t) { t.sendText(IS_WIN ? 'cls' : 'clear', true); }
-function termCmd(t, s) { t.sendText(s); }   // 真实命令（cmd/bash 均支持 && 与引号路径）
+function termClear(t) { return sendTerminalText(t, IS_WIN ? 'cls' : 'clear', true); }
+function termCmd(t, s) { return sendTerminalText(t, s, true); }   // 真实命令（cmd/bash 均支持 && 与引号路径）
 // 从构建/烧录输出里挑出真正的关键报错行，免得淹在几百行编译日志里
 function extractErrors(text) {
     const pat = /(FAILED|error:|Error:|undefined reference|multiple definition|fatal error|ninja: build stopped|No such file|not found|cannot find|Unable to|no such file)/;
@@ -628,7 +706,7 @@ async function doFlashAndBuild(run, flashOnly) {
         dirs.length ? t('{0} directories', String(dirs.length)) : t('none')));
     termLine(term, t('──── real command output below ────'));
     watchResult(term);
-    termCmd(term, cmd);
+    await termCmd(term, cmd);
     log(run, 'cmd sent');
 }
 
@@ -747,5 +825,6 @@ module.exports._internals = {
     detectTools, bundlesRoots, resolveTool, versionOf,
     scanTargets, findElfIn, predictElf,
     toolchainPathDirs, checkCompanions, envWithPath, pathPrefix, commandLine, extractErrors,
+    utf8Chunks, sendTerminalText,
     LOG_FILE, log, folderPath, wsRootPath, ansicodePage,
 };

@@ -117,6 +117,11 @@ When the toolchain cannot be detected, the extension shows a dialog and opens `s
 
 ## Changelog
 
+### v1.0.6
+
+- Fixed terminal input truncation, replay, or interleaving on macOS when a newly opened integrated terminal receives several status lines followed immediately by a long build-and-flash command (for example, `STM32_Programmer_CLIexport PATH=...`)
+- The extension now waits for shell integration before the first write when available, then serializes terminal writes and chunks macOS input on UTF-8 byte boundaries
+
 ### v1.0.5
 - **Fixed**: on an English UI the terminal name and the status bar tooltip still leaked Chinese - the terminal name now follows the display language
   (`STM32 Build & Flash` in English, `STM32 编译烧录` in Chinese), so English mode shows no Chinese anywhere in the UI or the terminal.

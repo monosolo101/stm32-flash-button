@@ -2,7 +2,7 @@
     "name": "stm32-oneclick-flash",
     "displayName": "STM32 One-Click Build & Flash",
     "description": "%description%",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "publisher": "conductance-lab",
     "license": "MIT",
     "icon": "icon.png",
@@ -51,6 +51,9 @@
         "workspaceContains:**/CMakePresets.json"
     ],
     "main": "./extension.js",
+    "scripts": {
+        "test": "node --test"
+    },
     "l10n": "./l10n",
     "contributes": {
         "commands": [

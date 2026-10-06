@@ -3,6 +3,7 @@
 .git/**
 .github/**
 node_modules/**
+test/**
 **/*.vsix
 package-lock.json
 # Marketplace 只读取 README.md，英文版无需打进包

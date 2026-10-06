@@ -125,6 +125,11 @@ code --install-extension /tmp/stm32-flash-button.vsix
 
 ## 变更记录
 
+### v1.0.6
+
+- 修复 macOS 上首次打开集成终端后，连续发送多条提示与较长的编译烧录命令可能造成输入截断、重放或交错（例如 `STM32_Programmer_CLIexport PATH=...`）
+- 新终端首次写入前等待 shell integration 就绪；macOS 上的终端文本改为按 UTF-8 字节安全分块、逐终端串行发送
+
 ### v1.0.5
 - **修复**：英文界面下终端名与状态栏悬停提示里会漏出中文 —— 终端名改为跟随显示语言
   （英文 `STM32 Build & Flash`、中文 `STM32 编译烧录`），英文模式下界面与终端已不再出现任何中文
@@ -172,4 +177,3 @@ code --install-extension /tmp/stm32-flash-button.vsix
   在 65001 下解码会变 `�`
 - **[新增]** `stm32flash.extraPathDirs` / `buildDir` / `programmerArgs` / `buildOnly` / `clearBeforeRun` 设置项，
   以及命令 `STM32: 选择构建目录`
-
